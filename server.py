@@ -12,8 +12,7 @@ ENC = "utf-8"
 
 
 def send_json(conn: socket.socket, obj: dict) -> None:
-    data = (json.dumps(obj) + "\n").encode(ENC)
-    conn.sendall(data)
+    conn.sendall((json.dumps(obj) + "\n").encode(ENC))
 
 
 def recv_line(conn: socket.socket) -> Optional[str]:
@@ -86,6 +85,7 @@ class Game:
     game_id: str
     max_players: int
     board_size: int
+    creator: str
     players: List[Player] = field(default_factory=list)
     board: List[List[str]] = field(default_factory=list)
     turn_index: int = 0
@@ -105,6 +105,7 @@ class Game:
     def snapshot(self) -> dict:
         return {
             "id": self.game_id,
+            "creator": self.creator,
             "players": [{"name": p.name, "mark": p.mark} for p in self.players],
             "max_players": self.max_players,
             "board_size": self.board_size,
@@ -120,19 +121,25 @@ class TicTacToeServer:
         self.games_lock = threading.Lock()
 
     def list_games(self) -> List[dict]:
+        # ✅ show only JOIN-able games (WAITING)
         with self.games_lock:
-            return [{
-                "id": g.game_id,
-                "players": len(g.players),
-                "max": g.max_players,
-                "status": g.status
-            } for g in self.games.values()]
+            out = []
+            for g in self.games.values():
+                if g.status != "WAITING":
+                    continue
+                out.append({
+                    "id": g.game_id,
+                    "players": len(g.players),
+                    "max": g.max_players,
+                    "status": g.status,
+                    "creator": g.creator
+                })
+            return out
 
-    def create_game(self, max_players: int) -> Game:
-        # Assignment: board size = (x+1)^2 => N = x+1
+    def create_game(self, max_players: int, creator: str) -> Game:
         board_size = max_players + 1
         game_id = uuid.uuid4().hex[:6].upper()
-        g = Game(game_id=game_id, max_players=max_players, board_size=board_size)
+        g = Game(game_id=game_id, max_players=max_players, board_size=board_size, creator=creator)
         with self.games_lock:
             self.games[game_id] = g
         return g
@@ -164,7 +171,6 @@ def safe_close(conn: socket.socket):
 
 
 def remove_player_from_game(g: Game, conn: socket.socket) -> Optional[str]:
-    """Remove conn from g.players. Return removed player's name (if found)."""
     name = None
     new_players = []
     for p in g.players:
@@ -174,7 +180,6 @@ def remove_player_from_game(g: Game, conn: socket.socket) -> Optional[str]:
             new_players.append(p)
     g.players = new_players
 
-    # keep turn_index valid
     if g.players:
         g.turn_index %= len(g.players)
     else:
@@ -186,9 +191,10 @@ def remove_player_from_game(g: Game, conn: socket.socket) -> Optional[str]:
 def client_thread(conn: socket.socket, addr: Tuple[str, int]):
     current_game: Optional[Game] = None
     player: Optional[Player] = None
+    client_name: str = "player"
 
     try:
-        send_json(conn, {"type": "WELCOME", "msg": "Welcome. Send HELLO with your name."})
+        send_json(conn, {"type": "WELCOME", "msg": "Connected to server."})
 
         while True:
             msg = recv_json(conn)
@@ -198,8 +204,8 @@ def client_thread(conn: socket.socket, addr: Tuple[str, int]):
             mtype = msg.get("type")
 
             if mtype == "HELLO":
-                name = msg.get("name", "player")
-                send_json(conn, {"type": "OK", "msg": f"Hello {name}. Use LIST/CREATE/JOIN. (Type INFO in client for help)"})
+                client_name = msg.get("name", "player")
+                send_json(conn, {"type": "OK", "msg": f"Hello {client_name}."})
 
             elif mtype == "LIST":
                 send_json(conn, {"type": "GAMES", "games": server_state.list_games()})
@@ -210,11 +216,12 @@ def client_thread(conn: socket.socket, addr: Tuple[str, int]):
                     continue
 
                 max_players = int(msg.get("players", 2))
+                creator = msg.get("name", client_name)  # ✅ always set creator
                 if max_players not in (2, 3):
                     err(conn, "Only 2 or 3 players supported.", "Use: CREATE 2  or  CREATE 3")
                     continue
 
-                g = server_state.create_game(max_players)
+                g = server_state.create_game(max_players, creator=creator)
                 send_json(conn, {"type": "OK", "msg": "Game created.", "game_id": g.game_id})
 
             elif mtype == "JOIN":
@@ -223,7 +230,7 @@ def client_thread(conn: socket.socket, addr: Tuple[str, int]):
                     continue
 
                 game_id = msg.get("game_id")
-                name = msg.get("name", "player")
+                name = msg.get("name", client_name)
                 g = server_state.get_game(game_id)
 
                 if not g:
@@ -253,18 +260,17 @@ def client_thread(conn: socket.socket, addr: Tuple[str, int]):
                         send_json(conn, {"type": "WAIT", "msg": "Waiting for more players...", "state": g.snapshot()})
 
             elif mtype == "LEAVE":
-                # LEAVE must work also when FINISHED (no extra END)
+                # ✅ Works also for FINISHED: just remove player, no extra END
                 if not current_game or not player:
                     err(conn, "Not in a game.", "Use LIST/CREATE/JOIN first.")
                     continue
 
                 g = current_game
-                left_conn = conn
 
                 with g.lock:
-                    left_name = remove_player_from_game(g, left_conn) or "player"
+                    left_name = remove_player_from_game(g, conn) or "player"
 
-                    # If RUNNING and someone leaves -> end game for remaining players
+                    # If RUNNING and someone leaves -> end for remaining players
                     if g.status == "RUNNING" and len(g.players) >= 1:
                         g.status = "FINISHED"
                         g.broadcast({
@@ -273,7 +279,7 @@ def client_thread(conn: socket.socket, addr: Tuple[str, int]):
                             "state": g.snapshot()
                         })
                     else:
-                        # WAITING or FINISHED: just update state (no forced END)
+                        # WAITING or FINISHED: just update (optional)
                         g.broadcast({"type": "GAME_UPDATE", "msg": f"{left_name} left the game.", "state": g.snapshot()})
 
                 server_state.remove_game_if_empty(g.game_id)
@@ -293,7 +299,7 @@ def client_thread(conn: socket.socket, addr: Tuple[str, int]):
 
                 with g.lock:
                     if g.status != "RUNNING":
-                        err(conn, "Game not running.", "Wait for START (enough players) or JOIN another game.")
+                        err(conn, "Game not running.", "Wait for START or JOIN another game.")
                         continue
                     if not g.players or g.players[g.turn_index].mark != player.mark:
                         err(conn, "Not your turn.", "Wait for your turn.")
@@ -328,7 +334,7 @@ def client_thread(conn: socket.socket, addr: Tuple[str, int]):
     except:
         pass
     finally:
-        # cleanup player from game on disconnect
+        # cleanup on disconnect (closing window / network drop)
         if current_game and player:
             g = current_game
             with g.lock:
