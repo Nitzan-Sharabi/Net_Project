@@ -1,12 +1,17 @@
 import socket
 import json
 import select
+import sys
 import time
 
-BUFFERS = {}
+
 HOST = "127.0.0.1"
 PORT = 5001
 ENC = "utf-8"
+
+# Per-socket receive buffer (newline-delimited JSON).
+BUFFERS = {}
+
 
 try:
     import msvcrt  # Windows standard lib
@@ -42,8 +47,37 @@ def recv_json(conn):
     return json.loads(line)
 
 
+def wait_for_types(sock, wanted_types):
+    """Block until a message type in wanted_types arrives (prints OK/ERR along the way)."""
+    while True:
+        msg = recv_json(sock)
+        if msg is None:
+            return None
+        t = msg.get("type")
+        if t in wanted_types:
+            return msg
+        if t == "OK" and msg.get("msg"):
+            print(f"✅ {msg['msg']}")
+        if t == "ERR":
+            print(f"❌ {msg.get('msg')}")
+            if msg.get("hint"):
+                print(f"➡ {msg['hint']}")
+
+
+def drain_socket(sock):
+    """Drain any pending messages (used when returning to lobby)."""
+    while True:
+        r, _, _ = select.select([sock], [], [], 0)
+        if not r:
+            return
+        msg = recv_json(sock)
+        if msg is None:
+            return
+
+
 def print_lobby_help():
-    print("""
+    print(
+        """
 Commands (Lobby):
   LIST              - show available games (WAITING only)
   CREATE 2          - create 2-player game (3x3) and auto-join
@@ -51,28 +85,29 @@ Commands (Lobby):
   JOIN <id>         - join an existing game by id
   INFO              - show this help
   QUIT              - disconnect and exit
-""".strip())
+""".strip()
+    )
 
 
 def print_game_help(n):
-    print(f"""
+    print(
+        f"""
 Commands (In Game):
-  row col           - make a move (example: 0 2)   [valid range: 0..{n-1}]
-  00                - shorthand for 0 0
+  row col           - make a move (example: 0 2)   [only on your turn]  [valid range: 0..{n-1}]
+  00                - shorthand for 0 0           [only on your turn]
   INFO              - show this help
-  LEAVE             - leave game and return to lobby
+  LEAVE             - leave game and return to lobby (works anytime)
   QUIT              - disconnect and exit
-""".strip())
+""".strip()
+    )
 
 
 def print_board(board):
     n = len(board)
     print()
-    header = "   " + " ".join([str(i) for i in range(n)])
-    print(header)
+    print("   " + " ".join(str(i) for i in range(n)))
     for r in range(n):
-        row = " ".join(board[r])
-        print(f"{r}  {row}")
+        print(f"{r}  " + " ".join(board[r]))
     print()
 
 
@@ -88,35 +123,6 @@ def pretty_print_games(ans):
     print()
 
 
-def wait_for_types(sock, wanted_types):
-    while True:
-        msg = recv_json(sock)
-        if msg is None:
-            return None
-        t = msg.get("type")
-        if t in wanted_types:
-            return msg
-        # swallow stray OK/ERR nicely
-        if t == "OK" and msg.get("msg"):
-            print(f"✅ {msg['msg']}")
-        if t == "ERR":
-            print(f"❌ {msg.get('msg')}")
-            if msg.get("hint"):
-                print(f"➡ {msg['hint']}")
-
-
-def drain_socket(sock):
-    """Remove any pending messages when we are in lobby to avoid garbage under LIST."""
-    while True:
-        r, _, _ = select.select([sock], [], [], 0)
-        if not r:
-            return
-        msg = recv_json(sock)
-        if msg is None:
-            return
-        # ignore; could optionally log
-
-
 def find_turn_player_name(state):
     turn_mark = state.get("turn")
     if not turn_mark:
@@ -127,13 +133,14 @@ def find_turn_player_name(state):
     return None
 
 
-def parse_move_input(raw: str):
-    raw = raw.strip()
+def parse_input(raw: str):
+    raw = (raw or "").strip()
     if not raw:
         return None
 
-    if raw.lower() in ("leave", "quit", "info", "help", "?"):
-        return raw.lower()
+    low = raw.lower()
+    if low in ("leave", "quit", "info", "help", "?"):
+        return low
 
     parts = raw.split()
     if len(parts) == 1 and len(parts[0]) == 2 and parts[0].isdigit():
@@ -145,28 +152,22 @@ def parse_move_input(raw: str):
     try:
         r = int(parts[0])
         c = int(parts[1])
-    except ValueError:
+    except Exception:
         return None
 
     return (r, c)
 
 
-def timed_input_windows(prompt, sock, abort_types={"END", "GAME_UPDATE", "START", "WAIT", "ERR"}):
-    """
-    Windows-only: non-blocking input.
-    While user types, we also check socket. If a message arrives (e.g., END), return (None, msg).
-    Otherwise return (line, None).
-    """
+def timed_input_windows(prompt, sock):
+    """Windows: allow socket updates while typing."""
     print(prompt, end="", flush=True)
     buf = ""
     while True:
-        # socket ready?
         r, _, _ = select.select([sock], [], [], 0)
         if r:
             msg = recv_json(sock)
             return None, msg
 
-        # keyboard?
         if msvcrt.kbhit():
             ch = msvcrt.getwch()
             if ch in ("\r", "\n"):
@@ -183,41 +184,106 @@ def timed_input_windows(prompt, sock, abort_types={"END", "GAME_UPDATE", "START"
         time.sleep(0.05)
 
 
-def prompt_move(state, my_name, my_mark, sock):
-    n = state["board_size"]
+def timed_input_posix(prompt, sock):
+    """POSIX: wait for either a socket message or a full line from stdin."""
+    print(prompt, end="", flush=True)
     while True:
-        prompt = f"Your move: {my_name} ({my_mark}). Enter 'row col' (0..{n-1}) or INFO/LEAVE/QUIT: "
+        r, _, _ = select.select([sock, sys.stdin], [], [], 0.1)
+        if sock in r:
+            msg = recv_json(sock)
+            return None, msg
+        if sys.stdin in r:
+            line = sys.stdin.readline()
+            if line == "":
+                return "quit", None
+            return line.rstrip("\n"), None
 
-        if HAS_MS:
-            raw, incoming = timed_input_windows(prompt, sock)
-            if incoming is not None:
-                # we got a message while waiting for input -> abort prompt and let main loop process it
-                return ("INCOMING", incoming)
+
+def timed_input(prompt, sock):
+    if HAS_MS:
+        return timed_input_windows(prompt, sock)
+    return timed_input_posix(prompt, sock)
+
+
+def prompt_action(state, my_name, my_mark, sock, allow_move: bool):
+    """Prompt in-game without blocking server updates.
+
+    - If allow_move: accept MOVE/INFO/LEAVE/QUIT
+    - Else: accept INFO/LEAVE/QUIT only
+    """
+    n = state["board_size"]
+    status = state.get("status")
+
+    turn_name = find_turn_player_name(state)
+
+    while True:
+        if allow_move:
+            prompt = f"Your move: {my_name} ({my_mark}). Enter 'row col' (0..{n-1}) or INFO/LEAVE/QUIT: "
         else:
-            raw = input(prompt)
+            if status == "WAITING":
+                prompt = "Waiting for players... You may type INFO/LEAVE/QUIT: "
+            else:
+                who = turn_name if turn_name else "the other player"
+                prompt = f"It's {who}'s turn. You may type INFO/LEAVE/QUIT: "
 
-        parsed = parse_move_input(raw)
+        raw, incoming = timed_input(prompt, sock)
+        if incoming is not None:
+            return ("INCOMING", incoming)
 
+        parsed = parse_input(raw)
         if parsed is None:
-            print("❌ Invalid format. Example: 0 0 (or shorthand: 00). Try again.")
+            if allow_move:
+                print("❌ Invalid format. Example: 0 0 (or shorthand: 00). Try again.")
+            else:
+                if status == "WAITING":
+                    print("❌ Invalid command. Allowed now: INFO / LEAVE / QUIT (game not started yet).")
+                else:
+                    print("❌ Invalid command. Allowed now: INFO / LEAVE / QUIT.")
             continue
 
         if parsed in ("info", "help", "?"):
             print_game_help(n)
             continue
-
         if parsed == "leave":
             return ("LEAVE",)
         if parsed == "quit":
             return ("QUIT",)
 
+        # Move
+        if not allow_move:
+            if status == "WAITING":
+                print("❌ Game not started yet. Allowed: INFO / LEAVE / QUIT.")
+            else:
+                print("❌ It's not your turn. Only INFO/LEAVE/QUIT are allowed. Type INFO for help.")
+            continue
+
         r, c = parsed
         return ("MOVE", r, c)
 
 
-def main():
-    name = input("Enter your name: ").strip() or "player"
+def leave_and_wait_ok(sock):
+    """Send LEAVE and wait until we get OK (ignore START/WAIT/GAME_UPDATE noise)."""
+    send_json(sock, {"type": "LEAVE"})
+    while True:
+        msg = recv_json(sock)
+        if msg is None:
+            return None
+        t = msg.get("type")
+        if t == "OK":
+            print(f"✅ {msg.get('msg', '')}".strip())
+            return msg
+        if t == "ERR":
+            print(f"❌ {msg.get('msg')}")
+            if msg.get("hint"):
+                print(f"➡ {msg['hint']}")
+            return msg
+        if t == "END":
+            res = msg.get("result", {})
+            if res.get("msg"):
+                print(f"Game ended: {res['msg']}")
 
+
+def main():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((HOST, PORT))
 
@@ -225,16 +291,28 @@ def main():
     if msg and msg.get("msg"):
         print(msg["msg"])
 
-    send_json(s, {"type": "HELLO", "name": name})
-    msg = recv_json(s)
-    if msg and msg.get("msg"):
-        print(msg["msg"])
-        print("Tip: type INFO to see available commands.\n")
+    # Unique name loop
+    while True:
+        name = input("Enter your name: ").strip()
+        if not name:
+            name = "player"
+        send_json(s, {"type": "HELLO", "name": name})
+        ans = wait_for_types(s, {"OK", "ERR"})
+        if ans is None:
+            print("Disconnected.")
+            return
+        if ans.get("type") == "OK":
+            print(ans.get("msg", ""))
+            print("Tip: type INFO to see commands.\n")
+            break
+        print(f"❌ {ans.get('msg')}")
+        if ans.get("hint"):
+            print(f"➡ {ans['hint']}")
 
     in_game = False
     last_state = None
     my_mark = None
-    pending_game_msg = None
+    pending_msg = None
 
     while True:
         if not in_game:
@@ -262,37 +340,31 @@ def main():
 
             if op == "CREATE":
                 players = int(parts[1]) if len(parts) > 1 else 2
-                send_json(s, {"type": "CREATE", "players": players, "name": name})
-
+                send_json(s, {"type": "CREATE", "players": players})
                 ans = wait_for_types(s, {"OK", "ERR"})
                 if ans is None:
                     print("Disconnected.")
                     break
                 if ans.get("type") == "ERR":
                     print(f"❌ {ans.get('msg')}")
-                    if ans.get("hint"):
-                        print(f"➡ {ans['hint']}")
                     continue
 
                 game_id = ans.get("game_id")
                 if not game_id:
-                    print("❌ CREATE failed (no game_id). Try LIST.")
+                    print("❌ CREATE failed (no game_id).")
                     continue
 
-                # ✅ AUTO-JOIN
-                send_json(s, {"type": "JOIN", "game_id": game_id, "name": name})
-                ans2 = wait_for_types(s, {"GAME_UPDATE", "WAIT", "START", "ERR"})
+                send_json(s, {"type": "JOIN", "game_id": game_id})
+                ans2 = wait_for_types(s, {"JOINED", "ERR"})
                 if ans2 is None:
                     print("Disconnected.")
                     break
                 if ans2.get("type") == "ERR":
                     print(f"❌ {ans2.get('msg')}")
-                    if ans2.get("hint"):
-                        print(f"➡ {ans2['hint']}")
                     continue
 
                 in_game = True
-                pending_game_msg = ans2
+                pending_msg = ans2
                 continue
 
             if op == "JOIN":
@@ -301,20 +373,17 @@ def main():
                     continue
 
                 game_id = parts[1]
-                send_json(s, {"type": "JOIN", "game_id": game_id, "name": name})
-
-                ans = wait_for_types(s, {"GAME_UPDATE", "WAIT", "START", "ERR"})
+                send_json(s, {"type": "JOIN", "game_id": game_id})
+                ans = wait_for_types(s, {"JOINED", "ERR"})
                 if ans is None:
                     print("Disconnected.")
                     break
                 if ans.get("type") == "ERR":
                     print(f"❌ {ans.get('msg')}")
-                    if ans.get("hint"):
-                        print(f"➡ {ans['hint']}")
                     continue
 
                 in_game = True
-                pending_game_msg = ans
+                pending_msg = ans
                 continue
 
             if op == "QUIT":
@@ -325,8 +394,8 @@ def main():
             continue
 
         # -------- In game --------
-        msg = pending_game_msg if pending_game_msg is not None else recv_json(s)
-        pending_game_msg = None
+        msg = pending_msg if pending_msg is not None else recv_json(s)
+        pending_msg = None
 
         if msg is None:
             print("Disconnected.")
@@ -334,16 +403,27 @@ def main():
 
         mtype = msg.get("type")
 
-        if mtype in ("GAME_UPDATE", "START", "WAIT"):
+        if mtype == "JOINED":
+            state = msg.get("state")
+            if msg.get("msg"):
+                print(f"\nℹ {msg['msg']}")
+            if state:
+                last_state = state
+                you = msg.get("you", {})
+                if you.get("mark"):
+                    my_mark = you["mark"]
+            continue
+
+        if mtype in ("WAIT", "START", "GAME_UPDATE"):
             state = msg.get("state")
             if not state:
                 continue
             last_state = state
 
             if my_mark is None:
-                for p in state["players"]:
-                    if p["name"] == name:
-                        my_mark = p["mark"]
+                for p in state.get("players", []):
+                    if p.get("name") == name:
+                        my_mark = p.get("mark")
                         break
 
             if msg.get("msg"):
@@ -352,21 +432,30 @@ def main():
             turn_name = find_turn_player_name(state)
             turn_mark = state.get("turn")
             print(f"\nGame {state['id']} | status={state['status']} | turn={turn_name} ({turn_mark})")
-            print("Players:", state["players"])
-            print_board(state["board"])
+            print("Players:", state.get("players"))
+            print_board(state.get("board"))
 
-            my_turn = (turn_mark == my_mark)
+            # FLOW FIX: don't prompt during transient WAITING when game is already full
+            if state.get("status") == "WAITING":
+                try:
+                    if len(state.get("players", [])) == int(state.get("max_players")):
+                        continue
+                except Exception:
+                    pass
 
-            if state["status"] == "RUNNING" and my_turn:
-                action = prompt_move(state, name, my_mark, s)
+            if state.get("status") in ("WAITING", "RUNNING"):
+                my_turn = (state.get("status") == "RUNNING") and (my_mark is not None) and (turn_mark == my_mark)
+                action = prompt_action(state, name, my_mark, s, allow_move=my_turn)
 
                 if action[0] == "INCOMING":
-                    # message arrived while user was typing -> handle it now
-                    pending_game_msg = action[1]
+                    pending_msg = action[1]
                     continue
 
                 if action[0] == "LEAVE":
-                    send_json(s, {"type": "LEAVE"})
+                    leave_and_wait_ok(s)
+                    in_game = False
+                    last_state = None
+                    my_mark = None
                     continue
 
                 if action[0] == "QUIT":
@@ -384,49 +473,75 @@ def main():
             print(f"\n❌ Error: {msg.get('msg')}")
             if msg.get("hint"):
                 print(f"➡ Next: {msg['hint']}")
+
+            if in_game and last_state and my_mark is not None and last_state.get("status") in ("WAITING", "RUNNING"):
+                turn_mark = last_state.get("turn")
+                my_turn = (last_state.get("status") == "RUNNING") and (turn_mark == my_mark)
+                action = prompt_action(last_state, name, my_mark, s, allow_move=my_turn)
+
+                if action[0] == "INCOMING":
+                    pending_msg = action[1]
+                    continue
+                if action[0] == "LEAVE":
+                    leave_and_wait_ok(s)
+                    in_game = False
+                    last_state = None
+                    my_mark = None
+                    continue
+                if action[0] == "QUIT":
+                    send_json(s, {"type": "QUIT"})
+                    break
+                if action[0] == "MOVE":
+                    _, r, c = action
+                    send_json(s, {"type": "MOVE", "row": r, "col": c})
+                    continue
+            continue
+
+        if mtype == "END":
+            res = msg.get("result", {})
+            state = msg.get("state")
+            if state:
+                print_board(state.get("board"))
+            if res.get("msg"):
+                print(f"Game ended: {res['msg']}")
+            elif res.get("winner"):
+                print("🏆 Winner:", res["winner"])
+            else:
+                print("Game ended.")
+
+            # Return to lobby cleanly
+            leave_and_wait_ok(s)
+            in_game = False
+            last_state = None
+            my_mark = None
             continue
 
         if mtype == "OK":
             if msg.get("msg"):
-                print(f"\n✅ {msg['msg']}")
-            if "Left game" in (msg.get("msg") or ""):
-                in_game = False
-                last_state = None
-                my_mark = None
-            continue
-
-        if mtype == "END":
-            state = msg.get("state")
-            if state:
-                print_board(state["board"])
-            res = msg.get("result", {})
-            if res.get("winner"):
-                print("🏆 Winner:", res["winner"])
-            elif res.get("draw"):
-                print("🤝 Draw.")
-            else:
-                print("Game ended:", res.get("msg", ""))
-
-            # auto-leave and wait for OK so lobby won't get garbage
-            send_json(s, {"type": "LEAVE"})
-            wait_for_types(s, {"OK", "ERR"})
-
-            in_game = False
-            last_state = None
-            my_mark = None
+                print(f"✅ {msg['msg']}")
             continue
 
         print("[MSG]", msg)
 
     try:
         BUFFERS.pop(s.fileno(), None)
-    except:
+    except Exception:
         pass
     try:
         s.close()
-    except:
+    except Exception:
         pass
 
+    except KeyboardInterrupt:
+        try:
+            send_json(s, {"type": "QUIT"})
+        except Exception:
+            pass
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()

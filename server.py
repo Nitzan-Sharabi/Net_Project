@@ -5,10 +5,13 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-BUFFERS = {}
+
 HOST = "127.0.0.1"
 PORT = 5001
 ENC = "utf-8"
+
+# Per-connection receive buffer (newline-delimited JSON).
+BUFFERS: Dict[int, bytes] = {}
 
 
 def send_json(conn: socket.socket, obj: dict) -> None:
@@ -35,7 +38,10 @@ def recv_json(conn: socket.socket) -> Optional[dict]:
     line = recv_line(conn)
     if line is None:
         return None
-    return json.loads(line)
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return {"type": "__BAD_JSON__"}
 
 
 def err(conn: socket.socket, msg: str, hint: str = "") -> None:
@@ -45,11 +51,19 @@ def err(conn: socket.socket, msg: str, hint: str = "") -> None:
     send_json(conn, payload)
 
 
+def safe_close(conn: socket.socket) -> None:
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
 def check_winner_3_in_row(board: List[List[str]]) -> Optional[str]:
     n = len(board)
     target = 3
 
-    def in_bounds(r, c): return 0 <= r < n and 0 <= c < n
+    def in_bounds(r: int, c: int) -> bool:
+        return 0 <= r < n and 0 <= c < n
 
     directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
     for r in range(n):
@@ -77,7 +91,7 @@ def board_full(board: List[List[str]]) -> bool:
 class Player:
     conn: socket.socket
     name: str
-    mark: str  # "X","O","Δ"
+    mark: str
 
 
 @dataclass
@@ -92,15 +106,8 @@ class Game:
     status: str = "WAITING"  # WAITING / RUNNING / FINISHED
     lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self.board = [[" " for _ in range(self.board_size)] for _ in range(self.board_size)]
-
-    def broadcast(self, obj: dict) -> None:
-        for p in list(self.players):
-            try:
-                send_json(p.conn, obj)
-            except:
-                pass
 
     def snapshot(self) -> dict:
         return {
@@ -111,29 +118,76 @@ class Game:
             "board_size": self.board_size,
             "board": self.board,
             "turn": self.players[self.turn_index].mark if self.players else None,
-            "status": self.status
+            "status": self.status,
         }
+
+    def broadcast(self, obj: dict) -> None:
+        for p in list(self.players):
+            try:
+                send_json(p.conn, obj)
+            except Exception:
+                pass
+
+
+    def broadcast_collect_dead(self, obj: dict) -> List[socket.socket]:
+        dead: List[socket.socket] = []
+        for p in list(self.players):
+            try:
+                send_json(p.conn, obj)
+            except Exception:
+                dead.append(p.conn)
+        return dead
+
+    def broadcast_except(self, obj: dict, except_conn: socket.socket) -> None:
+        for p in list(self.players):
+            if p.conn is except_conn:
+                continue
+            try:
+                send_json(p.conn, obj)
+            except Exception:
+                pass
 
 
 class TicTacToeServer:
-    def __init__(self):
+    def __init__(self) -> None:
         self.games: Dict[str, Game] = {}
         self.games_lock = threading.Lock()
 
+        # Enforce unique names across active connections.
+        self.names_lock = threading.Lock()
+        self.active_names: set[str] = set()
+
+        # Connection logging.
+        self.conn_lock = threading.Lock()
+        self.connected_count = 0
+
+    def log_connect(self, addr: Tuple[str, int]) -> None:
+        with self.conn_lock:
+            self.connected_count += 1
+            print(f"[CONNECTED] {addr} | total={self.connected_count}")
+
+    def log_disconnect(self, addr: Tuple[str, int], name: Optional[str]) -> None:
+        with self.conn_lock:
+            self.connected_count = max(0, self.connected_count - 1)
+            who = name if name else "<unknown>"
+            print(f"[DISCONNECTED] {addr} ({who}) | total={self.connected_count}")
+
     def list_games(self) -> List[dict]:
-        # ✅ show only JOIN-able games (WAITING)
+        # Only JOIN-able games (WAITING).
         with self.games_lock:
-            out = []
+            out: List[dict] = []
             for g in self.games.values():
                 if g.status != "WAITING":
                     continue
-                out.append({
-                    "id": g.game_id,
-                    "players": len(g.players),
-                    "max": g.max_players,
-                    "status": g.status,
-                    "creator": g.creator
-                })
+                out.append(
+                    {
+                        "id": g.game_id,
+                        "players": len(g.players),
+                        "max": g.max_players,
+                        "status": g.status,
+                        "creator": g.creator,
+                    }
+                )
             return out
 
     def create_game(self, max_players: int, creator: str) -> Game:
@@ -148,50 +202,66 @@ class TicTacToeServer:
         with self.games_lock:
             return self.games.get(game_id)
 
-    def remove_game_if_empty(self, game_id: str) -> None:
+    def remove_game(self, game_id: str) -> None:
         with self.games_lock:
-            g = self.games.get(game_id)
-            if g and len(g.players) == 0:
-                self.games.pop(game_id, None)
+            self.games.pop(game_id, None)
 
 
 server_state = TicTacToeServer()
 
-MARKS_BY_COUNT = {
-    2: ["X", "O"],
-    3: ["X", "O", "Δ"],
-}
-
-
-def safe_close(conn: socket.socket):
-    try:
-        conn.close()
-    except:
-        pass
+MARKS_BY_COUNT: Dict[int, List[str]] = {2: ["X", "O"], 3: ["X", "O", "Δ"]}
 
 
 def remove_player_from_game(g: Game, conn: socket.socket) -> Optional[str]:
-    name = None
-    new_players = []
+    left_name: Optional[str] = None
+    new_players: List[Player] = []
     for p in g.players:
         if p.conn is conn:
-            name = p.name
+            left_name = p.name
         else:
             new_players.append(p)
     g.players = new_players
-
     if g.players:
         g.turn_index %= len(g.players)
     else:
         g.turn_index = 0
+    return left_name
 
-    return name
+
+def close_game_for_all(g: Game, reason_msg: str) -> None:
+    """Close the game and notify all remaining players."""
+    g.status = "FINISHED"
+    dead = g.broadcast_collect_dead(
+        {"type": "END", "result": {"winner": None, "msg": reason_msg}, "state": g.snapshot()}
+    )
+    handle_dead_conns_after_send(g, dead, already_ending=True)
+
+def handle_dead_conns_after_send(g: Game, dead: List[socket.socket], already_ending: bool = False) -> None:
+    if not dead:
+        return
+
+    # Remove dead players
+    for dc in dead:
+        remove_player_from_game(g, dc)
+
+    # Requirement: any disconnect closes the game for everyone
+    if (not already_ending) and len(g.players) >= 1 and g.status != "FINISHED":
+        close_game_for_all(g, "A player disconnected. Game ended.")
 
 
-def client_thread(conn: socket.socket, addr: Tuple[str, int]):
+
+    # If nobody left, remove the game object
+    if len(g.players) == 0:
+        server_state.remove_game(g.game_id)
+
+
+def client_thread(conn: socket.socket, addr: Tuple[str, int]) -> None:
     current_game: Optional[Game] = None
     player: Optional[Player] = None
-    client_name: str = "player"
+
+    # Track name reservation for this connection.
+    name_registered = False
+    client_name: Optional[str] = None
 
     try:
         send_json(conn, {"type": "WELCOME", "msg": "Connected to server."})
@@ -204,85 +274,128 @@ def client_thread(conn: socket.socket, addr: Tuple[str, int]):
             mtype = msg.get("type")
 
             if mtype == "HELLO":
-                client_name = msg.get("name", "player")
+                if name_registered:
+                    err(conn, "Name already set.", "Continue in lobby (LIST/CREATE/JOIN) or QUIT.")
+                    continue
+
+                proposed = (msg.get("name") or "").strip()
+                if not proposed:
+                    err(conn, "Name cannot be empty.", "Enter a non-empty name.")
+                    continue
+
+                with server_state.names_lock:
+                    if proposed in server_state.active_names:
+                        err(conn, "Name already exists.", "Please choose a different name.")
+                        continue
+                    server_state.active_names.add(proposed)
+
+                client_name = proposed
+                name_registered = True
+                print(f"[NAME] {addr} -> {client_name}")
                 send_json(conn, {"type": "OK", "msg": f"Hello {client_name}."})
 
             elif mtype == "LIST":
                 send_json(conn, {"type": "GAMES", "games": server_state.list_games()})
 
             elif mtype == "CREATE":
+                if not name_registered or not client_name:
+                    err(conn, "You must set a unique name first.", "Send HELLO with your chosen name.")
+                    continue
                 if current_game is not None:
                     err(conn, "Already in a game.", "Use LEAVE to return to lobby, then CREATE again.")
                     continue
 
                 max_players = int(msg.get("players", 2))
-                creator = msg.get("name", client_name)  # ✅ always set creator
                 if max_players not in (2, 3):
                     err(conn, "Only 2 or 3 players supported.", "Use: CREATE 2  or  CREATE 3")
                     continue
 
-                g = server_state.create_game(max_players, creator=creator)
+                g = server_state.create_game(max_players, creator=client_name)
                 send_json(conn, {"type": "OK", "msg": "Game created.", "game_id": g.game_id})
 
             elif mtype == "JOIN":
+                if not name_registered or not client_name:
+                    err(conn, "You must set a unique name first.", "Send HELLO with your chosen name.")
+                    continue
                 if current_game is not None:
                     err(conn, "Already in a game.", "Use LEAVE to return to lobby, then JOIN another game.")
                     continue
 
                 game_id = msg.get("game_id")
-                name = msg.get("name", client_name)
-                g = server_state.get_game(game_id)
+                if not game_id:
+                    err(conn, "Missing game_id.", "Use JOIN <id> (Tip: use LIST).")
+                    continue
 
+                g = server_state.get_game(game_id)
                 if not g:
-                    err(conn, "Game not found.", "Use LIST to get a valid id, then JOIN <id>.")
+                    err(conn, "Game not found.", "Use LIST to get a valid id.")
                     continue
 
                 with g.lock:
                     if g.status != "WAITING":
-                        err(conn, "Game already started/finished.", "Use LIST and join a WAITING game.")
+                        err(conn, "Game already started/finished.", "Use LIST to find a WAITING game.")
                         continue
                     if len(g.players) >= g.max_players:
-                        err(conn, "Game is full.", "Create a new game (CREATE 2/3) or JOIN a different one.")
+                        err(conn, "Game is full.", "Use LIST and join another game.")
                         continue
 
-                    marks = MARKS_BY_COUNT[g.max_players]
-                    mark = marks[len(g.players)]
-                    player = Player(conn=conn, name=name, mark=mark)
+                    # Assign mark by join order.
+                    mark = MARKS_BY_COUNT[g.max_players][len(g.players)]
+                    player = Player(conn=conn, name=client_name, mark=mark)
                     g.players.append(player)
                     current_game = g
 
-                    g.broadcast({"type": "GAME_UPDATE", "msg": f"{name} joined as {mark}.", "state": g.snapshot()})
-
-                    if len(g.players) == g.max_players:
+                    # IMPORTANT FLOW FIX:
+                    # If the game becomes full now, switch to RUNNING BEFORE sending state to clients.
+                    is_full = (len(g.players) == g.max_players)
+                    if is_full:
                         g.status = "RUNNING"
-                        g.broadcast({"type": "START", "msg": "Game started! X plays first.", "state": g.snapshot()})
+                        g.turn_index = 0
+
+                    snap = g.snapshot()
+
+                    send_json(
+                        conn,
+                        {
+                            "type": "JOINED",
+                            "msg": f"Joined game {g.game_id} as {mark}.",
+                            "you": {"name": client_name, "mark": mark},
+                            "state": snap,
+                        },
+                    )
+
+                    g.broadcast_except(
+                        {"type": "GAME_UPDATE", "msg": f"{client_name} joined as {mark}.", "state": snap},
+                        except_conn=conn,
+                    )
+
+                    if is_full:
+                        dead = g.broadcast_collect_dead({"type": "START", "msg": "Game started! X plays first.", "state": snap})
+                        handle_dead_conns_after_send(g, dead)
                     else:
-                        send_json(conn, {"type": "WAIT", "msg": "Waiting for more players...", "state": g.snapshot()})
+                        dead = g.broadcast_collect_dead({"type": "WAIT", "msg": "Waiting for more players...", "state": snap})
+                        handle_dead_conns_after_send(g, dead)
+
+            elif mtype == "INFO":
+                send_json(conn, {"type": "OK", "msg": "Use client-side INFO for commands."})
 
             elif mtype == "LEAVE":
-                # ✅ Works also for FINISHED: just remove player, no extra END
                 if not current_game or not player:
                     err(conn, "Not in a game.", "Use LIST/CREATE/JOIN first.")
                     continue
 
                 g = current_game
-
                 with g.lock:
                     left_name = remove_player_from_game(g, conn) or "player"
 
-                    # If RUNNING and someone leaves -> end for remaining players
-                    if g.status == "RUNNING" and len(g.players) >= 1:
-                        g.status = "FINISHED"
-                        g.broadcast({
-                            "type": "END",
-                            "result": {"winner": None, "msg": f"Player {left_name} left. Game ended."},
-                            "state": g.snapshot()
-                        })
+                    # Requirement: leaving closes the game for everyone.
+                    if g.status in ("WAITING", "RUNNING") and len(g.players) >= 1:
+                        close_game_for_all(g, f"Player {left_name} left. Game ended.")
                     else:
-                        # WAITING or FINISHED: just update (optional)
-                        g.broadcast({"type": "GAME_UPDATE", "msg": f"{left_name} left the game.", "state": g.snapshot()})
+                        g.status = "FINISHED"
 
-                server_state.remove_game_if_empty(g.game_id)
+                if len(g.players) == 0:
+                    server_state.remove_game(g.game_id)
 
                 current_game = None
                 player = None
@@ -293,17 +406,20 @@ def client_thread(conn: socket.socket, addr: Tuple[str, int]):
                     err(conn, "Not in a game.", "JOIN a game first.")
                     continue
 
-                r = int(msg.get("row"))
-                c = int(msg.get("col"))
                 g = current_game
-
                 with g.lock:
                     if g.status != "RUNNING":
                         err(conn, "Game not running.", "Wait for START or JOIN another game.")
                         continue
+
+                    # Turn check.
                     if not g.players or g.players[g.turn_index].mark != player.mark:
-                        err(conn, "Not your turn.", "Wait for your turn.")
+                        err(conn, "Not your turn.", "Allowed while waiting: INFO or LEAVE (or QUIT).")
                         continue
+
+                    r = int(msg.get("row"))
+                    c = int(msg.get("col"))
+
                     if not (0 <= r < g.board_size and 0 <= c < g.board_size):
                         err(conn, "Out of bounds.", f"Use row/col in range 0..{g.board_size - 1}.")
                         continue
@@ -315,53 +431,67 @@ def client_thread(conn: socket.socket, addr: Tuple[str, int]):
 
                     winner = check_winner_3_in_row(g.board)
                     if winner:
-                        g.status = "FINISHED"
-                        g.broadcast({"type": "END", "result": {"winner": winner}, "state": g.snapshot()})
+                        close_game_for_all(g, f"Winner: {winner}")
                     elif board_full(g.board):
-                        g.status = "FINISHED"
-                        g.broadcast({"type": "END", "result": {"winner": None, "draw": True}, "state": g.snapshot()})
+                        close_game_for_all(g, "Draw.")
                     else:
                         g.turn_index = (g.turn_index + 1) % len(g.players)
-                        g.broadcast({"type": "GAME_UPDATE", "state": g.snapshot()})
+                        dead = g.broadcast_collect_dead({"type": "GAME_UPDATE", "state": g.snapshot()})
+                        handle_dead_conns_after_send(g, dead)
+
+                if g.status == "FINISHED" and len(g.players) == 0:
+                    server_state.remove_game(g.game_id)
 
             elif mtype == "QUIT":
                 send_json(conn, {"type": "OK", "msg": "Bye"})
                 break
 
+            elif mtype == "__BAD_JSON__":
+                err(conn, "Bad message format (invalid JSON).", "Try again.")
+                continue
+
             else:
                 err(conn, f"Unknown type {mtype}", "Use LIST/CREATE/JOIN/MOVE/LEAVE/QUIT.")
 
-    except:
-        pass
+    except Exception as e:
+        print(f"[ERROR] {addr} ({client_name}): {e!r}")
+
     finally:
-        # cleanup on disconnect (closing window / network drop)
+        # If connection dies while in a game: close game for everyone (same semantics as LEAVE).
         if current_game and player:
             g = current_game
             with g.lock:
                 left_name = remove_player_from_game(g, conn) or "player"
-                if g.status == "RUNNING" and len(g.players) >= 1:
-                    g.status = "FINISHED"
-                    g.broadcast({
-                        "type": "END",
-                        "result": {"winner": None, "msg": f"Player {left_name} disconnected. Game ended."},
-                        "state": g.snapshot()
-                    })
+                if g.status in ("WAITING", "RUNNING") and len(g.players) >= 1:
+                    close_game_for_all(g, f"Player {left_name} disconnected. Game ended.")
                 else:
-                    g.broadcast({"type": "GAME_UPDATE", "state": g.snapshot()})
-            server_state.remove_game_if_empty(g.game_id)
+                    g.status = "FINISHED"
+            if len(g.players) == 0:
+                server_state.remove_game(g.game_id)
+
+        # Release name reservation.
+        if name_registered and client_name:
+            with server_state.names_lock:
+                server_state.active_names.discard(client_name)
 
         safe_close(conn)
+        server_state.log_disconnect(addr, client_name)
 
 
-def main():
+def main() -> None:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
     s.bind((HOST, PORT))
     s.listen()
     print(f"[LISTENING] on {HOST}:{PORT}")
 
     while True:
         conn, addr = s.accept()
-        print("[CONNECTED]", addr)
+        server_state.log_connect(addr)
         t = threading.Thread(target=client_thread, args=(conn, addr), daemon=True)
         t.start()
 
